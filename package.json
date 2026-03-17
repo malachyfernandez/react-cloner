@@ -1,0 +1,35 @@
+{
+  "name": "react-visual-clone",
+  "version": "1.0.0",
+  "description": "CLI tool to create visual-only clones of React component subtrees",
+  "main": "dist/cli-final.js",
+  "bin": {
+    "react-visual-clone": "./dist/cli-final.js"
+  },
+  "scripts": {
+    "build": "tsc src/cli-final.ts src/patch/overwriteWithShell.ts --outDir dist --target ES2020 --module commonjs --moduleResolution node --esModuleInterop true --allowSyntheticDefaultImports true",
+    "dev": "tsx src/cli-final.ts",
+    "test": "node --test",
+    "start": "node dist/cli-final.js"
+  },
+  "keywords": ["react", "visual", "clone", "preview", "component"],
+  "author": "",
+  "license": "MIT",
+  "dependencies": {
+    "commander": "^12.0.0",
+    "fs-extra": "^11.2.0",
+    "fast-glob": "^3.3.2",
+    "recast": "^0.23.9",
+    "@babel/parser": "^7.24.4",
+    "@babel/traverse": "^7.24.4",
+    "prettier": "^3.2.5",
+    "ts-morph": "^23.0.0",
+    "typescript": "^5.4.3"
+  },
+  "devDependencies": {
+    "tsx": "^4.7.2",
+    "@types/node": "^20.12.7",
+    "@types/fs-extra": "^11.0.4",
+    "@types/prettier": "^3.0.0"
+  }
+}

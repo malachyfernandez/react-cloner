@@ -1,0 +1,1 @@
+{"version":3,"file":"detectComponentUsage.d.ts","sourceRoot":"","sources":["../../src/graph/detectComponentUsage.ts"],"names":[],"mappings":"AAIA,wBAAsB,oBAAoB,CAAC,QAAQ,EAAE,MAAM,GAAG,OAAO,CAAC;IACpE,OAAO,EAAE,GAAG,CAAC,MAAM,EAAE,MAAM,CAAC,CAAC;IAC7B,aAAa,EAAE,GAAG,CAAC,MAAM,CAAC,CAAC;CAC5B,CAAC,CAkCD"}
