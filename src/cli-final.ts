@@ -264,6 +264,13 @@ async function mirrorComponent(componentPath: string, componentInfo: any, projec
         .filter(Boolean)
     : [];
 
+  const componentNameMatch = content.match(/const\s+(\w+)\s*=\s*\(/)
+    ?? content.match(/function\s+(\w+)\s*\(/)
+    ?? content.match(/export\s+default\s+function\s+(\w+)\s*\(/);
+  const componentName = componentNameMatch?.[1] ?? path.basename(componentPath, path.extname(componentPath));
+  const returnMatch = content.match(/return\s*\(([\s\S]*?)\);/);
+  const originalJsx = returnMatch?.[1]?.trim() ?? '<></>';
+
   // Transformations
   let transformedContent = content;
   
@@ -300,9 +307,6 @@ async function mirrorComponent(componentPath: string, componentInfo: any, projec
     }
   );
   
-  // Remove interface definitions
-  transformedContent = transformedContent.replace(/interface\s+\w+Props\s*\{[^}]*\}/gs, '');
-  
   const previewDeclarations = destructuredProps.map((propName) => {
     const propType = propTypeMap.get(propName) ?? '';
     if (propType.includes('=>') || /^(on[A-Z]|set[A-Z])/.test(propName)) {
@@ -319,124 +323,85 @@ async function mirrorComponent(componentPath: string, componentInfo: any, projec
     }
     return `const __preview_${propName} = '${options.stringDefault}';`;
   });
-  const previewData = [`const __preview_text = '${options.stringDefault}';`, `const __preview_number = ${options.numberDefault};`, ...previewDeclarations].length > 0 ? `${[`const __preview_text = '${options.stringDefault}';`, `const __preview_number = ${options.numberDefault};`, ...previewDeclarations].join('\n')}
-` : '';
+  const previewData = `${[`const __preview_text = '${options.stringDefault}';`, `const __preview_number = ${options.numberDefault};`, `const __preview_boolean = ${options.booleanDefault};`, ...previewDeclarations].join('\n')}
+`;
 
-  const defaultedProps = destructuredProps
-    .map((propName) => `${propName} = __preview_${propName}`)
-    .join(', ');
-
-  if (defaultedProps) {
-    transformedContent = transformedContent.replace(
-      /const\s+(\w+)\s*=\s*\(\{[^}]*\}\s*:\s*\w+Props\)\s*=>/g,
-      `const $1 = ({ ${defaultedProps} } = {}) =>`
-    );
-    transformedContent = transformedContent.replace(
-      /function\s+(\w+)\s*\(\{[^}]*\}\s*:\s*\w+Props\)\s*\{/g,
-      `function $1({ ${defaultedProps} } = {}) {`
-    );
-  } else {
-    transformedContent = transformedContent.replace(
-      /const\s+(\w+)\s*=\s*\(\{[^}]*\}\s*:\s*\w+Props\)\s*=>/g,
-      'const $1 = () =>'
-    );
-    transformedContent = transformedContent.replace(
-      /function\s+(\w+)\s*\(\{[^}]*\}\s*:\s*\w+Props\)\s*\{/g,
-      'function $1() {'
-    );
-  }
-
-  transformedContent = transformedContent.replace(
-    /^import\s+\{[^}]*use\w+[^}]*\}\s+from\s+['"][^'"]*hooks\/[^'"]+['"];?\s*$/gm,
-    ''
-  );
-  transformedContent = transformedContent.replace(
-    /^import\s+use\w+\s+from\s+['"][^'"]*hooks\/[^'"]+['"];?\s*$/gm,
-    ''
-  );
-
-  transformedContent = transformedContent.replace(
-    /const\s+(\w+)\s*=\s*use[A-Z]\w*\(([\s\S]*?)\)\s*/g,
-    `const $1 = [{ value: { name: '${options.stringDefault}', id: '${options.stringDefault}' } }];\n`
-  );
-  transformedContent = transformedContent.replace(/\b\w+\.value\.[A-Za-z_$][\w$]*/g, '__preview_text');
-  transformedContent = transformedContent.replace(/\b\w+\?\.\[\d+\]\?*\.value\?*\.[A-Za-z_$][\w$]*/g, '__preview_text');
-  transformedContent = transformedContent.replace(
-    /(\w+)\?\.\[(\d+)\]\.value\.name/g,
-    '$1?.[$2]?.value?.name'
-  );
-  transformedContent = transformedContent.replace(
-    /(\w+)\?\.\[(\d+)\]\.value\.id/g,
-    '$1?.[$2]?.value?.id'
-  );
-  
-  // Insert after imports
-  const importLines = transformedContent.split('\n');
-  let insertIndex = 0;
-  for (let i = 0; i < importLines.length; i++) {
-    if (importLines[i].trim().startsWith('import')) {
-      insertIndex = i + 1;
-    } else if (insertIndex > 0 && !importLines[i].trim().startsWith('import') && importLines[i].trim() !== '') {
-      break;
-    }
-  }
-  
-  importLines.splice(insertIndex, 0, previewData);
-  transformedContent = importLines.join('\n');
-  
-  // Replace handlers
-  transformedContent = transformedContent.replace(/\b(on\w+)\s*=\{[^}]*\}/g, '$1={() => {}}');
-  transformedContent = transformedContent.replace(/\b(set\w+)\s*=\{[^}]*\}/g, '$1={() => {}}');
-  
-  // Replace dynamic expressions in JSX only (not in import statements)
-  // First, split by import statements to avoid touching them
-  const lines = transformedContent.split('\n');
-  const resultLines = [];
-  let inImportSection = true;
-  
-  for (const line of lines) {
-    if (inImportSection && !line.trim().startsWith('import') && line.trim() !== '') {
-      inImportSection = false;
-    }
-    
-    if (inImportSection) {
-      resultLines.push(line);
-    } else {
-      const trimmedLine = line.trim();
-      const looksLikeJsxLine = trimmedLine.includes('<') || trimmedLine.includes('>');
-      if (!looksLikeJsxLine) {
-        resultLines.push(line);
-        continue;
-      }
-      let simplifiedLine = line;
-      simplifiedLine = simplifiedLine.replace(/className=\{.*?\}(?=(\s+[A-Za-z_]\w*=|\s*\/?>))/g, 'className={__preview_text}');
-      simplifiedLine = simplifiedLine.replace(/key=\{.*?\}(?=(\s+[A-Za-z_]\w*=|\s*\/?>))/g, 'key={__preview_text}');
-      simplifiedLine = simplifiedLine.replace(/gap=\{.*?\}(?=(\s+[A-Za-z_]\w*=|\s*\/?>))/g, 'gap={__preview_number}');
-      simplifiedLine = simplifiedLine.replace(/index=\{.*?\}(?=(\s+[A-Za-z_]\w*=|\s*\/?>))/g, 'index={__preview_number}');
-      simplifiedLine = simplifiedLine.replace(/onPress=\{.*?\}(?=(\s+[A-Za-z_]\w*=|\s*\/?>))/g, 'onPress={() => {}}');
-      simplifiedLine = simplifiedLine.replace(/on\w+=\{.*?\}(?=(\s+[A-Za-z_]\w*=|\s*\/?>))/g, (match) => match.replace(/=\{.*?\}(?=(\s+[A-Za-z_]\w*=|\s*\/?>))/, '={() => {}}'));
-      simplifiedLine = simplifiedLine.replace(/set\w+=\{.*?\}(?=(\s+[A-Za-z_]\w*=|\s*\/?>))/g, (match) => match.replace(/=\{.*?\}(?=(\s+[A-Za-z_]\w*=|\s*\/?>))/, '={() => {}}'));
-      // Only replace dynamic expressions on JSX-ish lines
-      resultLines.push(simplifiedLine.replace(/\{([^{}]+)\}/g, (match, content) => {
-        const trimmed = content.trim();
-        
-        // Preserve common variable names and expressions
-        if (trimmed.includes('__preview_') || 
-            trimmed.includes('styles.') || 
-            /^\d+$/.test(trimmed) || 
-            trimmed === 'true' || 
-            trimmed === 'false') {
-          return match;
-        }
-        if (/^[a-zA-Z_$][\w$]*$/.test(trimmed) && !trimmed.startsWith('__preview_')) {
-          return '{__preview_text}';
-        }
+  let simplifiedJsx = originalJsx;
+  const simplifiedLines = simplifiedJsx
+    .split('\n')
+    .filter((line) => {
+      const trimmed = line.trim();
+      if (!trimmed) return true;
+      if (trimmed.startsWith('{/*') || trimmed.endsWith('*/}')) return false;
+      if (trimmed.startsWith('/*') || trimmed.startsWith('*') || trimmed.endsWith('*/')) return false;
+      if (trimmed.includes('.map(')) return false;
+      if (trimmed.includes('=>')) return false;
+      if (trimmed.includes('&&')) return false;
+      if (trimmed.includes(' ? ') || trimmed.includes('?:') || trimmed.startsWith('?') || trimmed.startsWith(':')) return false;
+      if (/^(variant|className|on\w+|set\w+|value|placeholder|text|subtext|gameCode|earliestDate)=/.test(trimmed)) return false;
+      if (trimmed === '>' || trimmed === '/>' || trimmed === '</>' || trimmed === '<>') return true;
+      if (trimmed === '{' || trimmed === '}' || trimmed === ')}' || trimmed === '))}' || trimmed === ') : (' || trimmed === ');') return false;
+      if (/^[()]+$/.test(trimmed)) return false;
+      return true;
+    })
+    .map((line) => {
+      let nextLine = line;
+      nextLine = nextLine.replace(/className=\{[^>]*\}/g, 'className={__preview_text}');
+      nextLine = nextLine.replace(/(on\w+)=\{.*?\}/g, '$1={() => {}}');
+      nextLine = nextLine.replace(/(set\w+)=\{.*?\}/g, '$1={() => {}}');
+      nextLine = nextLine.replace(/(className|key|value|placeholder|text|subtext|gameCode|entering|exiting|isOpen)=\{.*?\}/g, '$1={__preview_text}');
+      nextLine = nextLine.replace(/(gap|index|numColumns|size|count)=\{.*?\}/g, '$1={__preview_number}');
+      nextLine = nextLine.replace(/(disabled|visible|open)=\{.*?\}/g, '$1={__preview_boolean}');
+      nextLine = nextLine.replace(/\}\}/g, '}');
+      nextLine = nextLine.replace(/isOpen=\{__preview_text\}/g, 'isOpen={__preview_boolean}');
+      nextLine = nextLine.replace(/(iconProps)=\{\(\) => \{\}\}\}/g, '$1={{}}');
+      nextLine = nextLine.replace(/\{[^{}]*\}/g, (match) => {
+        const inner = match.slice(1, -1).trim();
+        if (!inner) return match;
+        if (inner.startsWith('__preview_')) return match;
+        if (/^\d+$/.test(inner)) return `{${options.numberDefault}}`;
+        if (inner === 'true' || inner === 'false') return `{${options.booleanDefault}}`;
         return '{__preview_text}';
-      }));
-    }
-  }
-  
-  transformedContent = resultLines.join('\n');
+      });
+      return nextLine;
+    })
+    .filter((line, index, arr) => {
+      const trimmed = line.trim();
+      if (!trimmed) return true;
+      if (trimmed === '</Animated.View>' && !arr.some((candidate) => candidate.includes('<Animated.View'))) return false;
+      if (trimmed === '</Column>' || trimmed === '</Row>' || trimmed === '</ScrollView>' || trimmed === '</ListRow>') return true;
+      return !trimmed.includes('$1');
+    });
+  simplifiedJsx = simplifiedLines.join('\n');
+  simplifiedJsx = simplifiedJsx.replace(/(on\w+)=\{\(\) => \{\}(?=(\s|\/?>))/g, '$1={() => {}}');
+  simplifiedJsx = simplifiedJsx.replace(/(set\w+)=\{\(\) => \{\}(?=(\s|\/?>))/g, '$1={() => {}}');
+  simplifiedJsx = simplifiedJsx.replace(/(on\w+)=\{\(\) => \{\}\s*$/gm, '$1={() => {}}');
+  simplifiedJsx = simplifiedJsx.replace(/(set\w+)=\{\(\) => \{\}\s*$/gm, '$1={() => {}}');
+  simplifiedJsx = simplifiedJsx.replace(/isOpen=\{__preview_text\}/g, 'isOpen={__preview_boolean}');
+  simplifiedJsx = simplifiedJsx.replace(/hasJoinedAGame=\{__preview_text\}/g, 'hasJoinedAGame={__preview_boolean}');
+  simplifiedJsx = simplifiedJsx.replace(/hasMadeAGame=\{__preview_text\}/g, 'hasMadeAGame={__preview_boolean}');
+
+  const importLines = transformedContent
+    .split('\n')
+    .map((line) => {
+      if (!line.trim().startsWith('import')) return line;
+      if (line.includes('hooks/')) return '';
+      if (line.startsWith('import React,')) return "import React from 'react';";
+      if (/import\s+\{[^}]+\}\s+from\s+['\"]types\//.test(line)) return '';
+      return line;
+    })
+    .filter((line) => line.trim().startsWith('import'));
+
+  transformedContent = `${importLines.join('\n')}
+${importLines.length ? '\n' : ''}${previewData}
+const ${componentName} = () => {
+  return (
+${simplifiedJsx}
+  );
+};
+
+export default ${componentName};
+`;
   
   await fs.writeFile(targetPath, transformedContent);
 }
