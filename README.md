@@ -6,11 +6,13 @@ A TypeScript CLI tool that creates visual-only clones of React component subtree
 
 - **Never modify the source project** - Always work on a copy
 - **Create a full copied project** in a new output directory  
-- **Generate a stripped "visual-only mirror"** of the chosen component subtree
-- **Remove hooks/custom logic** from every mirrored component
-- **Preserve JSX/layout/text/static styles**
-- **Keep ignored UI/layout components real**
-- **Patch the copied app** so it boots into the mirrored subtree
+- **Generate a stripped "visual-only mirror"** of the chosen component subtree (or the entire project via `--mirror-all`)
+- **Remove hooks/custom logic** from every mirrored component so the preview cannot crash from missing runtime data
+- **Preserve JSX/layout/text/static styles** so the preview remains faithful to the original look
+- **Keep ignored UI/layout components real** when you pass `--ignore`
+- **Patch the copied app** so it boots into the mirrored subtree using `overwrite-shell` or a component replacement strategy
+
+Because the transform is intentionally aggressive, mirrored components never accept props, call hooks, or access real data. Instead they render stable preview bindings (strings, numbers, arrays, objects) so that bundles succeed even when upstream state is unavailable.
 
 ## Installation
 
@@ -68,6 +70,7 @@ react-visual-clone generate \
 - `--number-default`: Default number value for preview (default: `1`)
 - `--boolean-default`: Default boolean value for preview (default: `true`)
 - `--image-placeholder`: Placeholder image URL (default: `https://via.placeholder.com/300x200`)
+- `--mirror-all`: Mirror every component file (excluding ignored folders) so the preview environment never relies on untouched business logic
 
 ## What It Does
 
@@ -82,21 +85,31 @@ react-visual-clone generate \
 - Detects `react-web` if `src/App.tsx` exists
 - Falls back to `react-web` if unsure
 
-### Phase 3: Build Subtree Graph
+### Phase 3: Build Subtree Graph / Global Mirror
 - Starting from the target component, recursively resolves local project component imports
 - Only follows imports that are used as JSX components
 - Marks components as `mirror-strip` or `opaque-real` based on ignore folders
 - Stops at ignored folders, node_modules, and non-component helpers
+- **Optional `--mirror-all`:** scans the entire project for additional `.tsx/.jsx` files and mirrors them too. This guarantees that no component accidentally falls back to real logic.
 
 ### Phase 4: Create Mirrored Files
 - Creates `.visual-clone/mirrored/` directory in the copied project
-- Mirrors each non-ignored component with visual-only transformations:
-  - Removes hooks (`useState`, `useEffect`, `useMemo`, etc.)
-  - Removes business logic and API calls
-  - Removes custom hooks
-  - Replaces handlers with noops
-  - Preserves JSX structure, literal text, static props, and styles
-  - Synthesizes preview data for missing props
+- Mirrors each non-ignored component with **strict visual-strip transformations**:
+  - Removes hooks (`useState`, `useEffect`, `useMemo`, router/auth/query hooks, etc.)
+  - Removes business logic, effects, reducers, and API calls
+  - Rewrites component signatures so mirrored components never take props
+  - Replaces handlers with noops and replaces dynamic JSX expressions with preview bindings
+  - Synthesizes preview data for every identifier the JSX references (strings, numbers, booleans, arrays, simple objects)
+  - Preserves JSX structure, literal text, static props, and styles so the layout matches the source
+- Mirrored files are intentionally deterministic and side-effect-free so repeated Expo/Web runs cannot regress due to missing data
+ 
+### Verification Workflow
+- `npm run build` inside `react-cloner`
+- `node dist/cli-final.js generate ... --mirror-all --base-mode overwrite-shell` to produce a fresh preview copy
+- `(cd preview && npm install)` to restore node_modules inside the copied project
+- `npx expo start --web --port <port>` (or native equivalents) to confirm bundling/runtime success
+
+This loop ensures every preview is produced from a clean slate and that the strict transform never leaves behind unmirrored logic.
 
 ### Phase 5: Patch Base File
 - Either replaces a specific component in the base file or rewrites the default export

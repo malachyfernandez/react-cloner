@@ -7,6 +7,7 @@ Object.defineProperty(exports, "__esModule", { value: true });
 const commander_1 = require("commander");
 const fs_extra_1 = __importDefault(require("fs-extra"));
 const path_1 = __importDefault(require("path"));
+const fast_glob_1 = __importDefault(require("fast-glob"));
 const parser_1 = require("@babel/parser");
 const traverse_1 = __importDefault(require("@babel/traverse"));
 const overwriteWithShell_1 = require("./patch/overwriteWithShell");
@@ -33,6 +34,7 @@ program
     .option('--number-default <value>', 'Default number value for preview', '1')
     .option('--boolean-default <value>', 'Default boolean value for preview', 'true')
     .option('--image-placeholder <url>', 'Placeholder image URL', 'https://via.placeholder.com/300x200')
+    .option('--mirror-all', 'Mirror every component file in the project, not just the target subtree', false)
     .action(async (options) => {
     try {
         console.log('=== React Visual Clone ===');
@@ -84,6 +86,48 @@ export const previewImage = { uri: '${options.imagePlaceholder}' };
         console.log(`Target component: ${targetComponentPath}`);
         const subtreeGraph = await buildSubtreeGraph(targetComponentPath, options.projectRoot, ignoreFolders);
         console.log(`Found ${subtreeGraph.size} components in subtree`);
+        if (options.mirrorAll) {
+            console.log('\n=== mirror-all: Scanning entire project for additional components ===');
+            const globIgnore = [
+                'node_modules/**',
+                '.git/**',
+                'dist/**',
+                'build/**',
+                '.expo/**',
+                'coverage/**',
+                'ios/**/build/**',
+                'android/**/build/**',
+                '.visual-clone/**',
+            ];
+            for (const folder of ignoreFolders) {
+                const sanitized = folder.replace(/^\/+/, '');
+                globIgnore.push(`${sanitized}/**`);
+            }
+            const additionalFiles = await (0, fast_glob_1.default)(['**/*.tsx', '**/*.jsx'], {
+                cwd: options.projectRoot,
+                ignore: globIgnore,
+            });
+            let addedCount = 0;
+            for (const posixPath of additionalFiles) {
+                const relativePath = posixPath;
+                if (subtreeGraph.has(relativePath))
+                    continue;
+                const isIgnored = ignoreFolders.some((folder) => {
+                    const normalizedFolder = folder.replace(/^\/+/, '');
+                    return relativePath.startsWith(`${normalizedFolder}`);
+                });
+                if (isIgnored)
+                    continue;
+                subtreeGraph.set(relativePath, {
+                    filePath: relativePath,
+                    mode: 'mirror-strip',
+                    imports: [],
+                    jsxComponents: [],
+                });
+                addedCount += 1;
+            }
+            console.log(`mirror-all: added ${addedCount} additional mirrored components (total ${subtreeGraph.size})`);
+        }
         // Debug: Print what we found
         for (const [componentPath, componentInfo] of subtreeGraph) {
             console.log(`  - ${componentPath} (${componentInfo.mode}) - JSX: ${componentInfo.jsxComponents.join(', ')}`);
