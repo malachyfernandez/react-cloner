@@ -35,6 +35,7 @@ program
     .option('--number-default <value>', 'Default number value for preview', '1')
     .option('--boolean-default <value>', 'Default boolean value for preview', 'true')
     .option('--image-placeholder <url>', 'Placeholder image URL', 'https://via.placeholder.com/300x200')
+    .option('--skip-components <components>', 'Comma-separated JSX component names to remove entirely')
     .option('--mirror-all', 'Mirror every component file in the project, not just the target subtree', false)
     .action(async (options) => {
     try {
@@ -42,6 +43,10 @@ program
         console.log(`Project root: ${options.projectRoot}`);
         console.log(`Target component: ${options.targetComponent}`);
         console.log(`Output path: ${options.out}`);
+        const skipComponents = options.skipComponents
+            ? options.skipComponents.split(',').map((name) => name.trim()).filter(Boolean)
+            : [];
+        options.skipComponentNameSet = new Set(skipComponents);
         // Phase 1: Copy project
         console.log('\n=== Phase 1: Copying Project ===');
         const ignoreFolders = options.ignore ? options.ignore.split(',') : [];
@@ -392,7 +397,10 @@ function sanitizeJsxChildren(children, options) {
             continue;
         }
         if (child.type === 'JSXElement' || child.type === 'JSXFragment') {
-            sanitizedChildren.push(sanitizeJsxNode(child, options));
+            const sanitized = sanitizeJsxNode(child, options);
+            if (sanitized) {
+                sanitizedChildren.push(sanitized);
+            }
             continue;
         }
         if (child.type !== 'JSXExpressionContainer') {
@@ -403,17 +411,26 @@ function sanitizeJsxChildren(children, options) {
         if (!expression || expression.type === 'JSXEmptyExpression')
             continue;
         if (expression.type === 'JSXElement' || expression.type === 'JSXFragment') {
-            sanitizedChildren.push(sanitizeJsxNode(expression, options));
+            const sanitized = sanitizeJsxNode(expression, options);
+            if (sanitized) {
+                sanitizedChildren.push(sanitized);
+            }
             continue;
         }
         if (expression.type === 'ConditionalExpression') {
             if (expression.consequent?.type === 'JSXElement' || expression.consequent?.type === 'JSXFragment') {
-                sanitizedChildren.push(sanitizeJsxNode(expression.consequent, options));
-                continue;
+                const sanitized = sanitizeJsxNode(expression.consequent, options);
+                if (sanitized) {
+                    sanitizedChildren.push(sanitized);
+                    continue;
+                }
             }
             if (expression.alternate?.type === 'JSXElement' || expression.alternate?.type === 'JSXFragment') {
-                sanitizedChildren.push(sanitizeJsxNode(expression.alternate, options));
-                continue;
+                const sanitized = sanitizeJsxNode(expression.alternate, options);
+                if (sanitized) {
+                    sanitizedChildren.push(sanitized);
+                    continue;
+                }
             }
             sanitizedChildren.push({
                 ...child,
@@ -423,8 +440,11 @@ function sanitizeJsxChildren(children, options) {
         }
         if (expression.type === 'LogicalExpression') {
             if (expression.right?.type === 'JSXElement' || expression.right?.type === 'JSXFragment') {
-                sanitizedChildren.push(sanitizeJsxNode(expression.right, options));
-                continue;
+                const sanitized = sanitizeJsxNode(expression.right, options);
+                if (sanitized) {
+                    sanitizedChildren.push(sanitized);
+                    continue;
+                }
             }
             sanitizedChildren.push({
                 ...child,
@@ -488,6 +508,9 @@ function sanitizeJsxNode(node, options) {
     }
     if (node.type !== 'JSXElement')
         return node;
+    if (shouldSkipJsxElement(node, options)) {
+        return null;
+    }
     return {
         ...node,
         openingElement: {
@@ -496,6 +519,39 @@ function sanitizeJsxNode(node, options) {
         },
         children: sanitizeJsxChildren(node.children, options),
     };
+}
+function getJsxElementName(node) {
+    if (!node)
+        return null;
+    if (node.type === 'JSXIdentifier') {
+        return node.name ?? null;
+    }
+    if (node.type === 'JSXMemberExpression') {
+        const objectName = getJsxElementName(node.object);
+        const propertyName = node.property?.name ?? null;
+        if (objectName && propertyName) {
+            return `${objectName}.${propertyName}`;
+        }
+        return propertyName ?? objectName;
+    }
+    if (node.type === 'JSXNamespacedName') {
+        const namespaceName = node.namespace?.name;
+        const name = node.name?.name;
+        if (namespaceName && name) {
+            return `${namespaceName}:${name}`;
+        }
+        return name ?? namespaceName ?? null;
+    }
+    return null;
+}
+function shouldSkipJsxElement(node, options) {
+    const skipSet = options?.skipComponentNameSet;
+    if (!skipSet || skipSet.size === 0)
+        return false;
+    const elementName = getJsxElementName(node?.openingElement?.name);
+    if (!elementName)
+        return false;
+    return skipSet.has(elementName);
 }
 function simplifyJsx(originalJsx, options, debugLabel) {
     const wrappedSource = `const __Preview = () => (${originalJsx});`;
@@ -510,8 +566,17 @@ function simplifyJsx(originalJsx, options, debugLabel) {
         throw new Error(`Failed to parse JSX for ${debugLabel}: ${error.message}`);
     }
     const declaration = ast.program.body[0].declarations[0];
-    const jsxNode = stripCommentsDeep(sanitizeJsxNode(cloneNode(declaration.init.body), options));
+    const sanitizedNode = sanitizeJsxNode(cloneNode(declaration.init.body), options) ?? createEmptyJsxFragment();
+    const jsxNode = stripCommentsDeep(sanitizedNode);
     return (0, generator_1.default)(jsxNode).code;
+}
+function createEmptyJsxFragment() {
+    return {
+        type: 'JSXFragment',
+        openingFragment: { type: 'JSXOpeningFragment' },
+        closingFragment: { type: 'JSXClosingFragment' },
+        children: [],
+    };
 }
 function extractReturnedJsx(content, componentName) {
     try {

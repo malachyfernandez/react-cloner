@@ -35,6 +35,7 @@ program
   .option('--number-default <value>', 'Default number value for preview', '1')
   .option('--boolean-default <value>', 'Default boolean value for preview', 'true')
   .option('--image-placeholder <url>', 'Placeholder image URL', 'https://via.placeholder.com/300x200')
+  .option('--skip-components <components>', 'Comma-separated JSX component names to remove entirely')
   .option('--mirror-all', 'Mirror every component file in the project, not just the target subtree', false)
   .action(async (options) => {
     try {
@@ -43,6 +44,11 @@ program
       console.log(`Target component: ${options.targetComponent}`);
       console.log(`Output path: ${options.out}`);
       
+      const skipComponents = options.skipComponents
+        ? options.skipComponents.split(',').map((name: string) => name.trim()).filter(Boolean)
+        : [];
+      options.skipComponentNameSet = new Set(skipComponents);
+
       // Phase 1: Copy project
       console.log('\n=== Phase 1: Copying Project ===');
       const ignoreFolders = options.ignore ? options.ignore.split(',') : [];
@@ -53,7 +59,7 @@ program
       function normalizeRel(root: string, file: string): string {
         return path.relative(root, file).split(path.sep).join("/");
       }
-      
+
       function shouldExcludeFromCopy(rel: string): boolean {
         return copyExcludes.some((excluded) => {
           return rel === excluded || rel.startsWith(`${excluded}/`);
@@ -417,7 +423,10 @@ function sanitizeJsxChildren(children: any[], options: any): any[] {
     }
 
     if (child.type === 'JSXElement' || child.type === 'JSXFragment') {
-      sanitizedChildren.push(sanitizeJsxNode(child, options));
+      const sanitized = sanitizeJsxNode(child, options);
+      if (sanitized) {
+        sanitizedChildren.push(sanitized);
+      }
       continue;
     }
 
@@ -430,18 +439,27 @@ function sanitizeJsxChildren(children: any[], options: any): any[] {
     if (!expression || expression.type === 'JSXEmptyExpression') continue;
 
     if (expression.type === 'JSXElement' || expression.type === 'JSXFragment') {
-      sanitizedChildren.push(sanitizeJsxNode(expression, options));
+      const sanitized = sanitizeJsxNode(expression, options);
+      if (sanitized) {
+        sanitizedChildren.push(sanitized);
+      }
       continue;
     }
 
     if (expression.type === 'ConditionalExpression') {
       if (expression.consequent?.type === 'JSXElement' || expression.consequent?.type === 'JSXFragment') {
-        sanitizedChildren.push(sanitizeJsxNode(expression.consequent, options));
-        continue;
+        const sanitized = sanitizeJsxNode(expression.consequent, options);
+        if (sanitized) {
+          sanitizedChildren.push(sanitized);
+          continue;
+        }
       }
       if (expression.alternate?.type === 'JSXElement' || expression.alternate?.type === 'JSXFragment') {
-        sanitizedChildren.push(sanitizeJsxNode(expression.alternate, options));
-        continue;
+        const sanitized = sanitizeJsxNode(expression.alternate, options);
+        if (sanitized) {
+          sanitizedChildren.push(sanitized);
+          continue;
+        }
       }
       sanitizedChildren.push({
         ...child,
@@ -452,8 +470,11 @@ function sanitizeJsxChildren(children: any[], options: any): any[] {
 
     if (expression.type === 'LogicalExpression') {
       if (expression.right?.type === 'JSXElement' || expression.right?.type === 'JSXFragment') {
-        sanitizedChildren.push(sanitizeJsxNode(expression.right, options));
-        continue;
+        const sanitized = sanitizeJsxNode(expression.right, options);
+        if (sanitized) {
+          sanitizedChildren.push(sanitized);
+          continue;
+        }
       }
       sanitizedChildren.push({
         ...child,
@@ -520,6 +541,10 @@ function sanitizeJsxNode(node: any, options: any): any {
 
   if (node.type !== 'JSXElement') return node;
 
+  if (shouldSkipJsxElement(node, options)) {
+    return null;
+  }
+
   return {
     ...node,
     openingElement: {
@@ -528,6 +553,38 @@ function sanitizeJsxNode(node: any, options: any): any {
     },
     children: sanitizeJsxChildren(node.children, options),
   };
+}
+
+function getJsxElementName(node: any): string | null {
+  if (!node) return null;
+  if (node.type === 'JSXIdentifier') {
+    return node.name ?? null;
+  }
+  if (node.type === 'JSXMemberExpression') {
+    const objectName = getJsxElementName(node.object);
+    const propertyName = node.property?.name ?? null;
+    if (objectName && propertyName) {
+      return `${objectName}.${propertyName}`;
+    }
+    return propertyName ?? objectName;
+  }
+  if (node.type === 'JSXNamespacedName') {
+    const namespaceName = node.namespace?.name;
+    const name = node.name?.name;
+    if (namespaceName && name) {
+      return `${namespaceName}:${name}`;
+    }
+    return name ?? namespaceName ?? null;
+  }
+  return null;
+}
+
+function shouldSkipJsxElement(node: any, options: any): boolean {
+  const skipSet: Set<string> | undefined = options?.skipComponentNameSet;
+  if (!skipSet || skipSet.size === 0) return false;
+  const elementName = getJsxElementName(node?.openingElement?.name);
+  if (!elementName) return false;
+  return skipSet.has(elementName);
 }
 
 function simplifyJsx(originalJsx: string, options: any, debugLabel: string): string {
@@ -543,8 +600,18 @@ function simplifyJsx(originalJsx: string, options: any, debugLabel: string): str
   }
 
   const declaration: any = (ast.program.body[0] as any).declarations[0];
-  const jsxNode = stripCommentsDeep(sanitizeJsxNode(cloneNode(declaration.init.body), options));
+  const sanitizedNode = sanitizeJsxNode(cloneNode(declaration.init.body), options) ?? createEmptyJsxFragment();
+  const jsxNode = stripCommentsDeep(sanitizedNode);
   return generate(jsxNode).code;
+}
+
+function createEmptyJsxFragment() {
+  return {
+    type: 'JSXFragment',
+    openingFragment: { type: 'JSXOpeningFragment' },
+    closingFragment: { type: 'JSXClosingFragment' },
+    children: [],
+  };
 }
 
 function extractReturnedJsx(content: string, componentName: string): string {
