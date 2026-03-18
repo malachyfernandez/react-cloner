@@ -10,6 +10,7 @@ const path_1 = __importDefault(require("path"));
 const fast_glob_1 = __importDefault(require("fast-glob"));
 const parser_1 = require("@babel/parser");
 const traverse_1 = __importDefault(require("@babel/traverse"));
+const generator_1 = __importDefault(require("@babel/generator"));
 const overwriteWithShell_1 = require("./patch/overwriteWithShell");
 const program = new commander_1.Command();
 program
@@ -248,6 +249,363 @@ async function buildSubtreeGraph(targetPath, projectRoot, ignoreFolders) {
     await analyzeComponent(relativeTargetPath);
     return graph;
 }
+function literalExpressionFromKind(kind, options) {
+    if (kind === 'number') {
+        return { type: 'NumericLiteral', value: Number(options.numberDefault) };
+    }
+    if (kind === 'boolean') {
+        return { type: 'BooleanLiteral', value: options.booleanDefault === true || options.booleanDefault === 'true' };
+    }
+    return { type: 'Identifier', name: '__preview_text' };
+}
+function inferExpressionKind(source) {
+    const trimmed = source.trim();
+    if (/^(true|false)$/.test(trimmed))
+        return 'boolean';
+    if (/^\d+(\.\d+)?$/.test(trimmed))
+        return 'number';
+    if (/(is|has|can|should|visible|disabled|open|highlighted|invisible|last)$/i.test(trimmed))
+        return 'boolean';
+    if (/(count|index|size|gap|length|total|page|offset|width|height)$/i.test(trimmed))
+        return 'number';
+    return 'text';
+}
+function inferAttributeKind(attributeName) {
+    if (/^(disabled|visible|open|is[A-Z]|has[A-Z]|can[A-Z]|should[A-Z])/.test(attributeName))
+        return 'boolean';
+    if (/^(gap|index|numColumns|size|count|length|page|offset|width|height)$/.test(attributeName))
+        return 'number';
+    return 'text';
+}
+function isStaticExpression(node) {
+    if (!node)
+        return true;
+    switch (node.type) {
+        case 'StringLiteral':
+        case 'NumericLiteral':
+        case 'BooleanLiteral':
+        case 'NullLiteral':
+            return true;
+        case 'TemplateLiteral':
+            return node.expressions.length === 0;
+        case 'ObjectExpression':
+            return node.properties.every((property) => property.type === 'ObjectProperty' && isStaticExpression(property.value));
+        case 'ArrayExpression':
+            return node.elements.every((element) => !element || isStaticExpression(element));
+        case 'UnaryExpression':
+            return isStaticExpression(node.argument);
+        default:
+            return false;
+    }
+}
+function sanitizeExpression(node, kind, options) {
+    if (!node)
+        return literalExpressionFromKind(kind, options);
+    if (isStaticExpression(node))
+        return node;
+    if (node.type === 'ArrowFunctionExpression' || node.type === 'FunctionExpression') {
+        return {
+            type: 'ArrowFunctionExpression',
+            id: null,
+            generator: false,
+            async: false,
+            params: [],
+            body: { type: 'BlockStatement', body: [], directives: [] },
+        };
+    }
+    if (node.type === 'ObjectExpression') {
+        return {
+            ...node,
+            properties: node.properties
+                .filter((property) => property.type === 'ObjectProperty')
+                .map((property) => ({
+                ...property,
+                value: sanitizeExpression(property.value, inferExpressionKind(property.key?.name ?? property.key?.value ?? ''), options),
+            })),
+        };
+    }
+    if (node.type === 'ArrayExpression') {
+        return {
+            ...node,
+            elements: node.elements.map((element) => (element ? sanitizeExpression(element, kind, options) : element)),
+        };
+    }
+    return literalExpressionFromKind(kind, options);
+}
+function cloneNode(node) {
+    return JSON.parse(JSON.stringify(node));
+}
+function stripCommentsDeep(node) {
+    if (!node || typeof node !== 'object')
+        return node;
+    delete node.comments;
+    delete node.leadingComments;
+    delete node.trailingComments;
+    delete node.innerComments;
+    for (const value of Object.values(node)) {
+        if (Array.isArray(value)) {
+            for (const item of value)
+                stripCommentsDeep(item);
+        }
+        else if (value && typeof value === 'object') {
+            stripCommentsDeep(value);
+        }
+    }
+    return node;
+}
+function inferKindFromNode(node) {
+    if (!node)
+        return 'text';
+    switch (node.type) {
+        case 'BooleanLiteral':
+            return 'boolean';
+        case 'NumericLiteral':
+            return 'number';
+        case 'StringLiteral':
+            return 'text';
+        case 'Identifier':
+            return inferExpressionKind(node.name ?? '');
+        case 'MemberExpression':
+            return inferExpressionKind(node.property?.name ?? node.property?.value ?? '');
+        case 'UnaryExpression':
+            if (node.operator === '!')
+                return 'boolean';
+            return inferKindFromNode(node.argument);
+        case 'BinaryExpression':
+        case 'LogicalExpression':
+            if (['==', '===', '!=', '!==', '>', '<', '>=', '<='].includes(node.operator))
+                return 'boolean';
+            return inferKindFromNode(node.left);
+        case 'ConditionalExpression':
+            return inferKindFromNode(node.consequent);
+        default:
+            return 'text';
+    }
+}
+function sanitizeJsxChildren(children, options) {
+    const sanitizedChildren = [];
+    for (const child of children ?? []) {
+        if (!child)
+            continue;
+        if (child.type === 'JSXText') {
+            sanitizedChildren.push(child);
+            continue;
+        }
+        if (child.type === 'JSXElement' || child.type === 'JSXFragment') {
+            sanitizedChildren.push(sanitizeJsxNode(child, options));
+            continue;
+        }
+        if (child.type !== 'JSXExpressionContainer') {
+            sanitizedChildren.push(child);
+            continue;
+        }
+        const expression = child.expression;
+        if (!expression || expression.type === 'JSXEmptyExpression')
+            continue;
+        if (expression.type === 'JSXElement' || expression.type === 'JSXFragment') {
+            sanitizedChildren.push(sanitizeJsxNode(expression, options));
+            continue;
+        }
+        if (expression.type === 'ConditionalExpression') {
+            if (expression.consequent?.type === 'JSXElement' || expression.consequent?.type === 'JSXFragment') {
+                sanitizedChildren.push(sanitizeJsxNode(expression.consequent, options));
+                continue;
+            }
+            if (expression.alternate?.type === 'JSXElement' || expression.alternate?.type === 'JSXFragment') {
+                sanitizedChildren.push(sanitizeJsxNode(expression.alternate, options));
+                continue;
+            }
+            sanitizedChildren.push({
+                ...child,
+                expression: sanitizeExpression(expression.consequent, inferKindFromNode(expression.test), options),
+            });
+            continue;
+        }
+        if (expression.type === 'LogicalExpression') {
+            if (expression.right?.type === 'JSXElement' || expression.right?.type === 'JSXFragment') {
+                sanitizedChildren.push(sanitizeJsxNode(expression.right, options));
+                continue;
+            }
+            sanitizedChildren.push({
+                ...child,
+                expression: sanitizeExpression(expression.right, inferKindFromNode(expression.left), options),
+            });
+            continue;
+        }
+        sanitizedChildren.push({
+            ...child,
+            expression: sanitizeExpression(expression, inferKindFromNode(expression), options),
+        });
+    }
+    return sanitizedChildren;
+}
+function sanitizeJsxAttributes(attributes, options) {
+    return (attributes ?? []).flatMap((attribute) => {
+        if (!attribute)
+            return [];
+        if (attribute.type !== 'JSXAttribute')
+            return [attribute];
+        if (!attribute.value)
+            return [attribute];
+        const attributeName = attribute.name?.name;
+        if (typeof attributeName !== 'string')
+            return [attribute];
+        if (['entering', 'exiting', 'layout', 'sharedTransitionTag'].includes(attributeName)) {
+            return [];
+        }
+        if (attribute.value.type === 'StringLiteral')
+            return [attribute];
+        if (attribute.value.type !== 'JSXExpressionContainer')
+            return [attribute];
+        if (attribute.value.expression?.type === 'JSXEmptyExpression')
+            return [];
+        if (/^on[A-Z]/.test(attributeName) || /^set[A-Z]/.test(attributeName)) {
+            return [{
+                    ...attribute,
+                    value: {
+                        ...attribute.value,
+                        expression: sanitizeExpression({ type: 'ArrowFunctionExpression', id: null, generator: false, async: false, params: [], body: { type: 'BlockStatement', body: [], directives: [] } }, 'text', options),
+                    },
+                }];
+        }
+        return [{
+                ...attribute,
+                value: {
+                    ...attribute.value,
+                    expression: sanitizeExpression(attribute.value.expression, inferAttributeKind(attributeName), options),
+                },
+            }];
+    });
+}
+function sanitizeJsxNode(node, options) {
+    if (!node)
+        return node;
+    if (node.type === 'JSXFragment') {
+        return {
+            ...node,
+            children: sanitizeJsxChildren(node.children, options),
+        };
+    }
+    if (node.type !== 'JSXElement')
+        return node;
+    return {
+        ...node,
+        openingElement: {
+            ...node.openingElement,
+            attributes: sanitizeJsxAttributes(node.openingElement.attributes, options),
+        },
+        children: sanitizeJsxChildren(node.children, options),
+    };
+}
+function simplifyJsx(originalJsx, options, debugLabel) {
+    const wrappedSource = `const __Preview = () => (${originalJsx});`;
+    let ast;
+    try {
+        ast = (0, parser_1.parse)(wrappedSource, {
+            sourceType: 'module',
+            plugins: ['typescript', 'jsx', 'classProperties'],
+        });
+    }
+    catch (error) {
+        throw new Error(`Failed to parse JSX for ${debugLabel}: ${error.message}`);
+    }
+    const declaration = ast.program.body[0].declarations[0];
+    const jsxNode = stripCommentsDeep(sanitizeJsxNode(cloneNode(declaration.init.body), options));
+    return (0, generator_1.default)(jsxNode).code;
+}
+function extractReturnedJsx(content, componentName) {
+    try {
+        const ast = (0, parser_1.parse)(content, {
+            sourceType: 'module',
+            plugins: ['typescript', 'jsx', 'classProperties'],
+        });
+        let foundReturn = null;
+        (0, traverse_1.default)(ast, {
+            FunctionDeclaration(path) {
+                if (foundReturn)
+                    return;
+                if (path.node.id?.name !== componentName)
+                    return;
+                path.traverse({
+                    ReturnStatement(returnPath) {
+                        if (!foundReturn && returnPath.node.argument) {
+                            foundReturn = returnPath.node.argument;
+                        }
+                    },
+                });
+            },
+            VariableDeclarator(path) {
+                if (foundReturn)
+                    return;
+                if (path.node.id.type !== 'Identifier' || path.node.id.name !== componentName)
+                    return;
+                const init = path.node.init;
+                if (!init || (init.type !== 'ArrowFunctionExpression' && init.type !== 'FunctionExpression'))
+                    return;
+                if (init.body.type === 'JSXElement' || init.body.type === 'JSXFragment') {
+                    foundReturn = init.body;
+                    return;
+                }
+                if (init.body.type === 'BlockStatement') {
+                    for (const statement of init.body.body) {
+                        if (statement.type === 'ReturnStatement' && statement.argument) {
+                            foundReturn = statement.argument;
+                            break;
+                        }
+                    }
+                }
+            },
+        });
+        if (foundReturn) {
+            return (0, generator_1.default)(stripCommentsDeep(cloneNode(foundReturn))).code;
+        }
+    }
+    catch {
+        // fall back to regex below
+    }
+    const returnMatch = content.match(/return\s*\(([\s\S]*?)\);/);
+    return returnMatch?.[1]?.trim() ?? '<></>';
+}
+function extractComponentName(content, fallbackName) {
+    try {
+        const ast = (0, parser_1.parse)(content, {
+            sourceType: 'module',
+            plugins: ['typescript', 'jsx', 'classProperties'],
+        });
+        for (const node of ast.program.body) {
+            if (node.type === 'ExportDefaultDeclaration') {
+                const declaration = node.declaration;
+                if (declaration?.type === 'FunctionDeclaration' && declaration.id?.name) {
+                    return declaration.id.name;
+                }
+                if (declaration?.type === 'Identifier' && declaration.name) {
+                    return declaration.name;
+                }
+            }
+        }
+        for (const node of ast.program.body) {
+            if (node.type === 'FunctionDeclaration' && node.id?.name) {
+                return node.id.name;
+            }
+            if (node.type === 'VariableDeclaration') {
+                for (const declaration of node.declarations) {
+                    if (declaration.id?.type === 'Identifier' && declaration.id.name) {
+                        return declaration.id.name;
+                    }
+                }
+            }
+        }
+    }
+    catch {
+        // fall back to regex below
+    }
+    const componentNameMatch = [
+        /export\s+default\s+function\s+(\w+)\s*\(/,
+        /const\s+(\w+)\s*=\s*\(/,
+        /function\s+(\w+)\s*\(/,
+    ].map((pattern) => content.match(pattern)).find(Boolean);
+    return componentNameMatch?.[1] ?? fallbackName;
+}
 async function mirrorComponent(componentPath, componentInfo, projectRoot, mirroredDir, options) {
     const sourcePath = path_1.default.resolve(projectRoot, componentPath);
     const targetPath = path_1.default.join(mirroredDir, componentPath);
@@ -279,12 +637,8 @@ async function mirrorComponent(componentPath, componentInfo, projectRoot, mirror
             .map((part) => part.replace(/\s*=.*$/, '').trim())
             .filter(Boolean)
         : [];
-    const componentNameMatch = content.match(/const\s+(\w+)\s*=\s*\(/)
-        ?? content.match(/function\s+(\w+)\s*\(/)
-        ?? content.match(/export\s+default\s+function\s+(\w+)\s*\(/);
-    const componentName = componentNameMatch?.[1] ?? path_1.default.basename(componentPath, path_1.default.extname(componentPath));
-    const returnMatch = content.match(/return\s*\(([\s\S]*?)\);/);
-    const originalJsx = returnMatch?.[1]?.trim() ?? '<></>';
+    const componentName = extractComponentName(content, path_1.default.basename(componentPath, path_1.default.extname(componentPath)));
+    const originalJsx = extractReturnedJsx(content, componentName);
     // Transformations
     let transformedContent = content;
     // Rewrite import paths for local imports
@@ -331,78 +685,7 @@ async function mirrorComponent(componentPath, componentInfo, projectRoot, mirror
     });
     const previewData = `${[`const __preview_text = '${options.stringDefault}';`, `const __preview_number = ${options.numberDefault};`, `const __preview_boolean = ${options.booleanDefault};`, ...previewDeclarations].join('\n')}
 `;
-    let simplifiedJsx = originalJsx;
-    const simplifiedLines = simplifiedJsx
-        .split('\n')
-        .filter((line) => {
-        const trimmed = line.trim();
-        if (!trimmed)
-            return true;
-        if (trimmed.startsWith('{/*') || trimmed.endsWith('*/}'))
-            return false;
-        if (trimmed.startsWith('/*') || trimmed.startsWith('*') || trimmed.endsWith('*/'))
-            return false;
-        if (trimmed.includes('.map('))
-            return false;
-        if (trimmed.includes('=>'))
-            return false;
-        if (trimmed.includes('&&'))
-            return false;
-        if (trimmed.includes(' ? ') || trimmed.includes('?:') || trimmed.startsWith('?') || trimmed.startsWith(':'))
-            return false;
-        if (/^(variant|className|on\w+|set\w+|value|placeholder|text|subtext|gameCode|earliestDate)=/.test(trimmed))
-            return false;
-        if (trimmed === '>' || trimmed === '/>' || trimmed === '</>' || trimmed === '<>')
-            return true;
-        if (trimmed === '{' || trimmed === '}' || trimmed === ')}' || trimmed === '))}' || trimmed === ') : (' || trimmed === ');')
-            return false;
-        if (/^[()]+$/.test(trimmed))
-            return false;
-        return true;
-    })
-        .map((line) => {
-        let nextLine = line;
-        nextLine = nextLine.replace(/className=\{[^>]*\}/g, 'className={__preview_text}');
-        nextLine = nextLine.replace(/(on\w+)=\{.*?\}/g, '$1={() => {}}');
-        nextLine = nextLine.replace(/(set\w+)=\{.*?\}/g, '$1={() => {}}');
-        nextLine = nextLine.replace(/(className|key|value|placeholder|text|subtext|gameCode|entering|exiting|isOpen)=\{.*?\}/g, '$1={__preview_text}');
-        nextLine = nextLine.replace(/(gap|index|numColumns|size|count)=\{.*?\}/g, '$1={__preview_number}');
-        nextLine = nextLine.replace(/(disabled|visible|open)=\{.*?\}/g, '$1={__preview_boolean}');
-        nextLine = nextLine.replace(/\}\}/g, '}');
-        nextLine = nextLine.replace(/isOpen=\{__preview_text\}/g, 'isOpen={__preview_boolean}');
-        nextLine = nextLine.replace(/(iconProps)=\{\(\) => \{\}\}\}/g, '$1={{}}');
-        nextLine = nextLine.replace(/\{[^{}]*\}/g, (match) => {
-            const inner = match.slice(1, -1).trim();
-            if (!inner)
-                return match;
-            if (inner.startsWith('__preview_'))
-                return match;
-            if (/^\d+$/.test(inner))
-                return `{${options.numberDefault}}`;
-            if (inner === 'true' || inner === 'false')
-                return `{${options.booleanDefault}}`;
-            return '{__preview_text}';
-        });
-        return nextLine;
-    })
-        .filter((line, index, arr) => {
-        const trimmed = line.trim();
-        if (!trimmed)
-            return true;
-        if (trimmed === '</Animated.View>' && !arr.some((candidate) => candidate.includes('<Animated.View')))
-            return false;
-        if (trimmed === '</Column>' || trimmed === '</Row>' || trimmed === '</ScrollView>' || trimmed === '</ListRow>')
-            return true;
-        return !trimmed.includes('$1');
-    });
-    simplifiedJsx = simplifiedLines.join('\n');
-    simplifiedJsx = simplifiedJsx.replace(/(on\w+)=\{\(\) => \{\}(?=(\s|\/?>))/g, '$1={() => {}}');
-    simplifiedJsx = simplifiedJsx.replace(/(set\w+)=\{\(\) => \{\}(?=(\s|\/?>))/g, '$1={() => {}}');
-    simplifiedJsx = simplifiedJsx.replace(/(on\w+)=\{\(\) => \{\}\s*$/gm, '$1={() => {}}');
-    simplifiedJsx = simplifiedJsx.replace(/(set\w+)=\{\(\) => \{\}\s*$/gm, '$1={() => {}}');
-    simplifiedJsx = simplifiedJsx.replace(/isOpen=\{__preview_text\}/g, 'isOpen={__preview_boolean}');
-    simplifiedJsx = simplifiedJsx.replace(/hasJoinedAGame=\{__preview_text\}/g, 'hasJoinedAGame={__preview_boolean}');
-    simplifiedJsx = simplifiedJsx.replace(/hasMadeAGame=\{__preview_text\}/g, 'hasMadeAGame={__preview_boolean}');
+    let simplifiedJsx = simplifyJsx(originalJsx, options, componentPath);
     const importLines = transformedContent
         .split('\n')
         .map((line) => {
@@ -419,7 +702,9 @@ async function mirrorComponent(componentPath, componentInfo, projectRoot, mirror
         .filter((line) => line.trim().startsWith('import'));
     transformedContent = `${importLines.join('\n')}
 ${importLines.length ? '\n' : ''}${previewData}
-const ${componentName} = () => {
+type __PreviewProps = Record<string, unknown>;
+
+const ${componentName} = (_props: __PreviewProps = {}) => {
   return (
 ${simplifiedJsx}
   );
